@@ -1,0 +1,548 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>stones</title>
+  <style>
+    * {
+      box-sizing: border-box;
+    }
+
+    html,
+    body {
+      width: 100%;
+      height: 100%;
+      margin: 0;
+    }
+
+    body {
+      display: grid;
+      place-items: center;
+      overflow: hidden;
+      background: #f4f1ea;
+      color: #2f2d29;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    .app {
+      width: min(92vw, 920px);
+      display: grid;
+      gap: 14px;
+    }
+
+    .controls {
+      display: flex;
+      justify-content: center;
+      gap: 22px;
+      color: rgba(47, 45, 41, 0.72);
+      font-size: 13px;
+    }
+
+    .control {
+      display: grid;
+      grid-template-columns: auto 120px 2ch;
+      align-items: center;
+      gap: 10px;
+    }
+
+    .control input {
+      width: 120px;
+      accent-color: #2f2d29;
+    }
+
+    .count {
+      color: #2f2d29;
+      font-variant-numeric: tabular-nums;
+      text-align: right;
+    }
+
+    .stage {
+      width: 100%;
+      aspect-ratio: 16 / 10;
+      position: relative;
+      border: 1px solid rgba(45, 42, 37, 0.08);
+      background: #faf8f3;
+      box-shadow: 0 24px 60px rgba(47, 45, 41, 0.12);
+    }
+
+    canvas {
+      display: block;
+      width: 100%;
+      height: 100%;
+      cursor: grab;
+      touch-action: none;
+    }
+
+    canvas:active {
+      cursor: grabbing;
+    }
+
+    @media (max-width: 620px) {
+      .controls {
+        align-items: stretch;
+        flex-direction: column;
+        gap: 10px;
+      }
+
+      .control {
+        grid-template-columns: 44px 1fr 2ch;
+      }
+
+      .control input {
+        width: 100%;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="app">
+    <div class="controls" aria-label="stone controls">
+      <label class="control">
+        <span>Black</span>
+        <input id="blackCount" type="range" min="0" max="10" value="1">
+        <span class="count" id="blackValue">1</span>
+      </label>
+      <label class="control">
+        <span>White</span>
+        <input id="whiteCount" type="range" min="0" max="10" value="1">
+        <span class="count" id="whiteValue">1</span>
+      </label>
+    </div>
+
+    <section class="stage" aria-label="stones physics canvas">
+      <canvas id="world"></canvas>
+    </section>
+  </main>
+
+  <script src="https://cdn.jsdelivr.net/npm/matter-js@0.20.0/build/matter.min.js"></script>
+  <script>
+    const {
+      Bodies,
+      Body,
+      Composite,
+      Engine,
+      Mouse,
+      MouseConstraint,
+      Render,
+      Runner
+    } = Matter;
+
+    const canvas = document.querySelector("#world");
+    const stage = document.querySelector(".stage");
+    const blackCountInput = document.querySelector("#blackCount");
+    const whiteCountInput = document.querySelector("#whiteCount");
+    const blackValue = document.querySelector("#blackValue");
+    const whiteValue = document.querySelector("#whiteValue");
+    const engine = Engine.create();
+    const world = engine.world;
+
+    world.gravity.y = 0;
+
+    const stoneRadius = 48;
+    const spawnMargin = stoneRadius + 16;
+    const spawnPadding = 10;
+    const wallThickness = 260;
+    const maxStoneSpeed = 22;
+    const emergencyClampMargin = stoneRadius * 1.5;
+    const minSoundStrength = 0.9;
+    const soundCooldown = 120;
+    const stoneStyles = {
+      black: { color: "#171717", stroke: "#080808" },
+      white: { color: "#f7f5ef", stroke: "#d8d3c7" }
+    };
+
+    let stones = [];
+    let walls = [];
+    let canvasWidth = 0;
+    let canvasHeight = 0;
+    let draggedStone = null;
+    let audioContext = null;
+    let audioReady = false;
+    const lastSoundAt = new Map();
+
+    const render = Render.create({
+      canvas,
+      engine,
+      options: {
+        width: stage.clientWidth,
+        height: stage.clientHeight,
+        wireframes: false,
+        background: "#faf8f3",
+        pixelRatio: 1
+      }
+    });
+
+    const runner = Runner.create();
+    Render.run(render);
+    Runner.run(runner, engine);
+
+    const mouse = Mouse.create(canvas);
+    const mouseConstraint = MouseConstraint.create(engine, {
+      mouse,
+      constraint: {
+        stiffness: 0.16,
+        damping: 0.08,
+        render: { visible: false }
+      }
+    });
+
+    Composite.add(world, mouseConstraint);
+    render.mouse = mouse;
+
+    function createStone(config) {
+      return Bodies.circle(config.x, config.y, stoneRadius, {
+        label: config.name,
+        restitution: 0.94,
+        friction: 0.03,
+        frictionAir: 0.014,
+        density: 0.004,
+        render: {
+          visible: false,
+          fillStyle: config.color,
+          strokeStyle: config.stroke,
+          lineWidth: 2
+        }
+      });
+    }
+
+    function createWalls(width, height) {
+      const wallOptions = {
+        label: "wall",
+        isStatic: true,
+        restitution: 0.95,
+        friction: 0.01
+      };
+
+      return [
+        Bodies.rectangle(width / 2, -wallThickness / 2, width + wallThickness * 2, wallThickness, { ...wallOptions }),
+        Bodies.rectangle(width / 2, height + wallThickness / 2, width + wallThickness * 2, wallThickness, { ...wallOptions }),
+        Bodies.rectangle(-wallThickness / 2, height / 2, wallThickness, height + wallThickness * 2, { ...wallOptions }),
+        Bodies.rectangle(width + wallThickness / 2, height / 2, wallThickness, height + wallThickness * 2, { ...wallOptions })
+      ];
+    }
+
+    function unlockAudio() {
+      if (!audioContext) {
+        audioContext = new (window.AudioContext || window.webkitAudioContext)();
+      }
+
+      audioContext.resume();
+      audioReady = true;
+    }
+
+    function playTok({ frequency, volume, wave }) {
+      if (!audioReady || !audioContext) {
+        return;
+      }
+
+      const now = audioContext.currentTime;
+      const oscillator = audioContext.createOscillator();
+      const gain = audioContext.createGain();
+
+      oscillator.type = wave;
+      oscillator.frequency.setValueAtTime(frequency, now);
+      oscillator.frequency.exponentialRampToValueAtTime(frequency * 0.72, now + 0.08);
+
+      gain.gain.setValueAtTime(0.0001, now);
+      gain.gain.exponentialRampToValueAtTime(volume, now + 0.006);
+      gain.gain.exponentialRampToValueAtTime(0.0001, now + 0.12);
+
+      oscillator.connect(gain);
+      gain.connect(audioContext.destination);
+      oscillator.start(now);
+      oscillator.stop(now + 0.13);
+    }
+
+    function collisionStrength(pair) {
+      const { bodyA, bodyB, collision } = pair;
+      const x = bodyA.velocity.x - bodyB.velocity.x;
+      const y = bodyA.velocity.y - bodyB.velocity.y;
+
+      return Math.abs(x * collision.normal.x + y * collision.normal.y);
+    }
+
+    function collisionSoundKey(bodyA, bodyB) {
+      return [bodyA.id, bodyB.id].sort((a, b) => a - b).join(":");
+    }
+
+    function playCollisionSound(pair) {
+      const { bodyA, bodyB } = pair;
+      const isStoneA = stones.includes(bodyA);
+      const isStoneB = stones.includes(bodyB);
+
+      if (!isStoneA && !isStoneB) {
+        return;
+      }
+
+      const strength = collisionStrength(pair);
+      if (strength < minSoundStrength) {
+        return;
+      }
+
+      const now = performance.now();
+      const key = collisionSoundKey(bodyA, bodyB);
+      if (now - (lastSoundAt.get(key) || 0) < soundCooldown) {
+        return;
+      }
+
+      lastSoundAt.set(key, now);
+
+      const isStoneHit = isStoneA && isStoneB;
+      const volume = Math.min(0.18, 0.035 + strength * (isStoneHit ? 0.018 : 0.012));
+
+      playTok({
+        frequency: isStoneHit ? 260 : 430,
+        volume,
+        wave: isStoneHit ? "triangle" : "sine"
+      });
+    }
+
+    function limitStoneVelocity(stone) {
+      const { x, y } = stone.velocity;
+      const speed = Math.hypot(x, y);
+
+      if (speed > maxStoneSpeed) {
+        const scale = maxStoneSpeed / speed;
+        Body.setVelocity(stone, {
+          x: x * scale,
+          y: y * scale
+        });
+      }
+    }
+
+    function clampStoneInsideCanvas(stone, force = false) {
+      const minX = stoneRadius;
+      const minY = stoneRadius;
+      const maxX = Math.max(minX, canvasWidth - stoneRadius);
+      const maxY = Math.max(minY, canvasHeight - stoneRadius);
+      const escapedX = stone.position.x < -emergencyClampMargin || stone.position.x > canvasWidth + emergencyClampMargin;
+      const escapedY = stone.position.y < -emergencyClampMargin || stone.position.y > canvasHeight + emergencyClampMargin;
+      const x = Math.min(Math.max(stone.position.x, minX), maxX);
+      const y = Math.min(Math.max(stone.position.y, minY), maxY);
+
+      if (!force && !escapedX && !escapedY) {
+        return;
+      }
+
+      Body.setPosition(stone, { x, y });
+
+      if (!escapedX && !escapedY) {
+        return;
+      }
+
+      const movingOutX = (x === minX && stone.velocity.x < 0) || (x === maxX && stone.velocity.x > 0);
+      const movingOutY = (y === minY && stone.velocity.y < 0) || (y === maxY && stone.velocity.y > 0);
+
+      if (movingOutX || movingOutY) {
+        Body.setVelocity(stone, {
+          x: movingOutX ? -stone.velocity.x * 0.6 : stone.velocity.x,
+          y: movingOutY ? -stone.velocity.y * 0.6 : stone.velocity.y
+        });
+      }
+    }
+
+    function fitCanvas() {
+      const width = stage.clientWidth;
+      const height = stage.clientHeight;
+
+      canvasWidth = width;
+      canvasHeight = height;
+      render.options.width = width;
+      render.options.height = height;
+      render.bounds.max.x = width;
+      render.bounds.max.y = height;
+      render.canvas.width = width;
+      render.canvas.height = height;
+      render.canvas.style.width = width + "px";
+      render.canvas.style.height = height + "px";
+
+      Composite.remove(world, walls);
+      walls = createWalls(width, height);
+      Composite.add(world, walls);
+    }
+
+    function currentStoneCounts() {
+      return {
+        black: Number(blackCountInput.value),
+        white: Number(whiteCountInput.value)
+      };
+    }
+
+    function updateCountLabels() {
+      blackValue.textContent = blackCountInput.value;
+      whiteValue.textContent = whiteCountInput.value;
+    }
+
+    function randomBetween(min, max) {
+      return min + Math.random() * (max - min);
+    }
+
+    function stoneOverlaps(x, y, placedStones, minDistance) {
+      return placedStones.some((stone) => {
+        return Math.hypot(x - stone.x, y - stone.y) < minDistance;
+      });
+    }
+
+    function randomStoneLayout(counts) {
+      const configs = [];
+      const total = counts.black + counts.white;
+
+      if (total === 0) {
+        return configs;
+      }
+
+      const minX = Math.min(spawnMargin, canvasWidth / 2);
+      const minY = Math.min(spawnMargin, canvasHeight / 2);
+      const maxX = Math.max(minX, canvasWidth - spawnMargin);
+      const maxY = Math.max(minY, canvasHeight - spawnMargin);
+      const types = [
+        ...Array(counts.black).fill("black"),
+        ...Array(counts.white).fill("white")
+      ];
+
+      types.forEach((type) => {
+        let x = randomBetween(minX, maxX);
+        let y = randomBetween(minY, maxY);
+        let minDistance = stoneRadius * 2 + spawnPadding;
+
+        for (let tries = 0; tries < 500 && stoneOverlaps(x, y, configs, minDistance); tries += 1) {
+          if (tries === 300) {
+            minDistance = stoneRadius * 2;
+          }
+
+          x = randomBetween(minX, maxX);
+          y = randomBetween(minY, maxY);
+        }
+
+        configs.push({
+          name: type,
+          x,
+          y,
+          ...stoneStyles[type]
+        });
+      });
+
+      return configs;
+    }
+
+    function resetStones() {
+      Composite.remove(world, stones);
+      draggedStone = null;
+      lastSoundAt.clear();
+
+      stones = randomStoneLayout(currentStoneCounts()).map(createStone);
+
+      Composite.add(world, stones);
+      stones.forEach((stone) => {
+        Body.setVelocity(stone, { x: 0, y: 0 });
+        Body.setAngularVelocity(stone, 0);
+        clampStoneInsideCanvas(stone, true);
+      });
+    }
+
+    function drawStones() {
+      const context = render.context;
+
+      if (draggedStone) {
+        const { x, y } = draggedStone.position;
+        const mousePosition = mouse.position;
+
+        context.save();
+        context.beginPath();
+        context.moveTo(x, y);
+        context.lineTo(mousePosition.x, mousePosition.y);
+        context.strokeStyle = "rgba(47, 45, 41, 0.24)";
+        context.lineWidth = 1;
+        context.setLineDash([4, 8]);
+        context.stroke();
+        context.restore();
+      }
+
+      stones.forEach((stone) => {
+        const { x, y } = stone.position;
+        const isWhite = stone.label === "white";
+        const isDragged = stone === draggedStone;
+
+        context.save();
+        context.translate(x, y);
+        context.rotate(stone.angle);
+        context.beginPath();
+        context.arc(0, 0, stoneRadius, 0, Math.PI * 2);
+        context.fillStyle = isWhite ? "#f7f5ef" : "#171717";
+        context.strokeStyle = isWhite ? "#d8d3c7" : "#080808";
+        context.lineWidth = 2;
+        context.fill();
+        context.stroke();
+
+        context.beginPath();
+        context.arc(0, 0, stoneRadius - 8, 0, Math.PI * 2);
+        context.strokeStyle = isWhite ? "rgba(80, 72, 60, 0.12)" : "rgba(255, 255, 255, 0.08)";
+        context.lineWidth = 1.5;
+        context.stroke();
+
+        if (isDragged) {
+          context.beginPath();
+          context.arc(0, 0, stoneRadius + 6, 0, Math.PI * 2);
+          context.strokeStyle = "rgba(47, 45, 41, 0.36)";
+          context.lineWidth = 1.5;
+          context.stroke();
+        }
+
+        context.restore();
+      });
+    }
+
+    Matter.Events.on(render, "afterRender", drawStones);
+
+    Matter.Events.on(engine, "afterUpdate", () => {
+      stones.forEach(clampStoneInsideCanvas);
+    });
+
+    Matter.Events.on(engine, "collisionStart", (event) => {
+      event.pairs.forEach(playCollisionSound);
+    });
+
+    Matter.Events.on(mouseConstraint, "startdrag", (event) => {
+      if (stones.includes(event.body)) {
+        draggedStone = event.body;
+      }
+    });
+
+    Matter.Events.on(mouseConstraint, "enddrag", (event) => {
+      if (stones.includes(event.body)) {
+        clampStoneInsideCanvas(event.body, true);
+        limitStoneVelocity(event.body);
+      }
+
+      draggedStone = null;
+    });
+
+    window.addEventListener("keydown", (event) => {
+      unlockAudio();
+
+      if (event.key.toLowerCase() === "r") {
+        resetStones();
+      }
+    });
+
+    window.addEventListener("pointerdown", unlockAudio, { once: true });
+
+    [blackCountInput, whiteCountInput].forEach((input) => {
+      input.addEventListener("input", () => {
+        updateCountLabels();
+        resetStones();
+      });
+    });
+
+    window.addEventListener("resize", () => {
+      fitCanvas();
+      stones.forEach((stone) => clampStoneInsideCanvas(stone, true));
+    });
+
+    fitCanvas();
+    updateCountLabels();
+    resetStones();
+  </script>
+</body>
+</html>
