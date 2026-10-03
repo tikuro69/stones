@@ -4,6 +4,10 @@ A small browser art prototype with flat Othello/Reversi-like stones and simple p
 
 Built with a single `index.html` file using HTML, CSS, JavaScript, Matter.js, and the Web Audio API.
 
+## Live demo
+
+[Try the live demo](https://tikuro69.github.io/stones/)
+
 ## Features
 
 - Drag stones with the mouse.
